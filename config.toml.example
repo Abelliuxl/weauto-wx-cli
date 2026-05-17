@@ -1,0 +1,174 @@
+# Read side: wx-cli
+wx_binary = "wx"
+poll_interval_sec = 2.0
+state_path = "data/state.json"
+
+# Safety: keep true until you have tested focus and coordinates.
+dry_run = true
+
+# Image resolution: decrypt wx-cli .dat files into viewable images
+enable_image_resolver = true
+image_output_dir = "data/images"
+max_replies_per_tick = 2
+skip_existing_on_start = true
+send_lock_path = "data/send.lock"
+send_action_interval_sec = 0.6
+
+# "hermes" matches weauto-bridge style: Hermes returns structured actions.
+# "template" keeps the earlier local smoke-test reply path.
+processing_mode = "agent"  # "agent" uses the local LLM agent; "template" uses static replies
+
+# macOS WeChat GUI sender
+app_name = "WeChat"
+activate_wait_sec = 0.6
+click_move_duration_sec = 0.18
+mouse_down_hold_sec = 0.03
+post_select_wait_sec = 0.35
+post_input_click_wait_sec = 0.08
+post_paste_wait_sec = 0.06
+focus_verify_enabled = true
+focus_verify_max_clicks = 3
+
+# Legacy local reply generation, only used when processing_mode = "template".
+reply_mode = "template"
+reply_template = "收到：{text}"
+reply_command = ""
+
+# Ignore self messages when wx-cli exposes sender/is_self fields.
+self_names = []
+
+# Only reply to these chat titles. Empty means all chats.
+allow_chats = []
+
+# Never reply to these chat titles.
+deny_chats = []
+
+# Group chat identification prefix.
+group_title_prefixes = ["群"]
+
+# Keywords treated as urgent (like @mentions): bypass cooldown, always reply.
+group_reply_keywords = ["@助手", "@机器人", "机器人", "bot", "小助手"]
+
+# Cooldown between replies to non-urgent group messages (seconds). 0 = disabled.
+# Urgent messages (@mentions and keyword hits) always bypass this cooldown.
+group_reply_cooldown_sec = 0.0
+people_aliases_enabled = true
+people_aliases_path = "data/PEOPLE_ALIASES.md"
+people_memory_dir = "data/people"
+people_context_max_items = 8
+
+# Proxy used by this project process and Hermes CLI mode.
+# start_bot.sh removes proxy env from launchd-managed Hermes gateway because
+# launchd Python cannot reliably route to this LAN proxy on this machine.
+# Keep localhost in no_proxy so this project can still call the local gateway.
+proxy_enabled = false
+proxy_url = ""
+no_proxy = "127.0.0.1,localhost,::1"
+
+# These keys intentionally match weauto/weauto-bridge so their calibrators can
+# write directly into this config.
+use_manual_row_boxes = false
+manual_row_boxes_path = "data/manual_row_boxes.json"
+row_title_region_enabled = false
+preview_region_enabled = false
+rows_max = 8
+row_height_ratio = 0.145
+
+[agent]
+enabled = true
+# Agent identity/personality description (inline text).
+identity_text = ""
+# Path to identity MD file (used if identity_text is empty).
+identity_path = "data/identity.md"
+personality_path = "data/personality.md"
+# Periodic self-reflection heartbeat for maintaining memories, skills, impressions.
+heartbeat_enabled = true
+heartbeat_interval_sec = 300.0
+
+[agent.main]
+api_key = ""
+api_key_env = "LONGCAT_API_KEY"
+model = "LongCat-Flash-Lite"
+base_url = "https://api.longcat.chat/openai/v1"
+timeout_sec = 60.0
+max_tokens = 4096
+
+# Vision LLM for image analysis (called as a tool by the main LLM)
+[agent.vision]
+api_key = ""
+api_key_env = "DOUBAO_API_KEY"
+model = "doubao-seed-2-0-mini-260215"
+base_url = ""  # falls back to env DOUBAO_BASE_URL
+timeout_sec = 60.0
+max_tokens = 4096
+
+# Ratios are relative to the main WeChat window.
+[list_region]
+x = 0.065
+y = 0.12
+w = 0.325
+h = 0.82
+
+# Row-local ratios with left-bottom anchor, copied from weauto-bridge.
+[row_title_region]
+x = 0.24
+y = 0.52
+w = 0.58
+h = 0.42
+
+[preview_text_region]
+x = 0.24
+y = 0.10
+w = 0.72
+h = 0.52
+
+[chat_title_region]
+x = 0.40
+y = 0.01
+w = 0.57
+h = 0.10
+
+[input_point]
+x = 0.73
+y = 0.92
+
+[ocr]
+min_score = 0.25
+enhance = false
+
+[manual_rows]
+enabled = false
+path = "data/manual_row_boxes.json"
+
+[people]
+enabled = true
+aliases_path = "data/PEOPLE_ALIASES.md"
+memory_dir = "data/people"
+max_items = 8
+
+[proxy]
+enabled = false
+url = ""
+no_proxy = "127.0.0.1,localhost,::1"
+
+# Volcengine Ark built-in web search (Doubao LLM-powered search).
+# Uses the Ark /responses endpoint with the built-in web_search tool.
+# Requires an ARK_API_KEY from console.volcengine.com.
+[volc_ark]
+enabled = false
+base_url = "https://ark.cn-beijing.volces.com/api/v3"
+api_key = ""
+api_key_env = "ARK_API_KEY"
+model = "doubao-seed-1-8-251228"
+limit = 8
+max_keyword = 3
+timeout_sec = 20.0
+
+[unread_badge]
+min_blob_pixels = 70
+
+[unread_badge_circle]
+enabled = false
+x = 0.86
+y = 0.66
+r = 0.18
