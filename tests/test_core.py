@@ -2,7 +2,7 @@ import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from weauto_wx_cli.agent import Agent
+from weauto_wx_cli.agent import Agent, AgentResult
 from weauto_wx_cli.config import load_config
 from weauto_wx_cli.bot import AutoSpeakBot
 from weauto_wx_cli.detector import title_matches
@@ -174,6 +174,26 @@ def test_agent_parses_chat_completion_tool_calls():
     ]
 
 
+def test_agent_parses_read_chat_history_tool_call():
+    cfg = load_config("config.toml.example")
+    agent = Agent(cfg)
+    actions = agent._parse_tool_calls(
+        {
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_chat_history",
+                        "arguments": '{"limit":200}',
+                    },
+                }
+            ]
+        },
+        default_title="群-游戏",
+    )
+    assert actions == [{"type": "read_chat_history", "chat_title": "群-游戏", "limit": 100}]
+
+
 def test_agent_call_llm_uses_registered_tools():
     cfg = load_config("config.toml.example")
     agent = Agent(cfg)
@@ -200,6 +220,24 @@ def test_agent_call_llm_uses_registered_tools():
     assert seen["tool_choice"] == "auto"
     assert any(item["function"]["name"] == "send_message" for item in seen["tools"])
     assert result.actions == [{"type": "send_message", "title": "测试群", "message": "ok"}]
+
+
+def test_agent_finalize_wraps_plain_content_as_send_message():
+    cfg = load_config("config.toml.example")
+    agent = Agent(cfg)
+    seen = {}
+
+    def fake_chat(messages, **kwargs):
+        seen.update(kwargs)
+        return {"message": {"content": "没拿到原链接，只能按标题猜搜索。"}}
+
+    agent._main_llm.chat = fake_chat
+    result = agent.finalize_response(chat_title="群-测试", original_text="@助手 看看")
+    assert seen["tool_choice"] == "required"
+    assert {item["function"]["name"] for item in seen["tools"]} == {"send_message", "noop"}
+    assert result.actions == [
+        {"type": "send_message", "title": "群-测试", "message": "没拿到原链接，只能按标题猜搜索。"}
+    ]
 
 
 def test_agent_action_parser_repairs_missing_final_brace():
@@ -273,6 +311,41 @@ def test_group_non_urgent_blocked_by_cooldown():
         [{"chat": "群-测试", "sender": "A", "content": "普通群消息", "type": "文本"}]
     )[0]
     assert bot._should_reply(msg) is False
+
+
+def test_web_actions_read_chat_history_then_finalize(monkeypatch):
+    cfg = load_config("config.toml.example")
+    bot = AutoSpeakBot(cfg)
+    calls = {}
+
+    def fake_get_history(chat_title, limit=10):
+        calls["history"] = (chat_title, limit)
+        return "[12:00] 石山勇: [链接] 视频标题"
+
+    def fake_handle_message(msg):
+        calls["feed_text"] = msg.text
+        return AgentResult(actions=[], raw_response='{"message":{"content":"普通 content"}}')
+
+    def fake_finalize_response(**kwargs):
+        calls["finalize"] = kwargs
+        return AgentResult(
+            actions=[{"type": "send_message", "title": kwargs["chat_title"], "message": "没拿到原链接。"}],
+            raw_response="{}",
+        )
+
+    monkeypatch.setattr(bot.agent, "_get_history", fake_get_history)
+    monkeypatch.setattr(bot.agent, "handle_message", fake_handle_message)
+    monkeypatch.setattr(bot.agent, "finalize_response", fake_finalize_response)
+    actions = bot._process_web_actions(
+        [{"type": "read_chat_history", "limit": 50}],
+        original_chat_title="群-测试",
+        original_text="@助手 看看石山勇转发的视频",
+        original_sender="A",
+    )
+    assert calls["history"] == ("群-测试", 50)
+    assert "[chat_history] 群-测试 limit=50" in calls["feed_text"]
+    assert "视频标题" in calls["finalize"]["tool_trace"]
+    assert actions == [{"type": "send_message", "title": "群-测试", "message": "没拿到原链接。"}]
 
 
 def test_title_matching_tolerates_ocr_noise():

@@ -93,6 +93,7 @@ class AgentConfig:
         "search_web_brave (query, proxy=true/false) — Brave web search. "
         "search_web_volc (query) — Doubao LLM-powered web search (Volcengine Ark). "
         "browse_url (url, proxy=true/false) — Playwright browser, returns rendered page text. "
+        "read_chat_history (chat_title, limit) — read recent WeChat chat history; use this instead of guessing local message file paths. "
         "read_file (path) — read a file inside the project directory. "
         "list_files (pattern) — list files matching a glob pattern (e.g. data/**/*.md). "
         "Set proxy=false for domestic sites, proxy=true for international sites that need the proxy. "

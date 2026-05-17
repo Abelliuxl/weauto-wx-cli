@@ -295,6 +295,7 @@ class AutoSpeakBot:
     def _process_web_actions(self, actions: list[dict[str, Any]], original_chat_title: str = "", original_text: str = "", original_sender: str = "") -> list[dict[str, Any]]:
         max_rounds = 20
         current = list(actions)
+        tool_trace: list[tuple[str, str]] = []
         original_title = ""
         for a in current:
             t = str(a.get("title", "") or a.get("chat_title", "")).strip()
@@ -355,6 +356,19 @@ class AutoSpeakBot:
                     raw_result = self._list_local_files(pattern)
                     self._log("web-fetch", round=_round + 1, method="list_files", pattern=pattern, result_len=len(raw_result))
                     web_results.append((f"[list] {pattern}", raw_result[:4000]))
+                elif kind == "read_chat_history":
+                    chat_title = str(action.get("chat_title", "") or action.get("title", "") or original_title).strip()
+                    try:
+                        limit = int(action.get("limit", 50))
+                    except (TypeError, ValueError):
+                        limit = 50
+                    limit = max(1, min(100, limit))
+                    if chat_title:
+                        raw_result = self.agent._get_history(chat_title, limit=limit)
+                        if not raw_result.strip():
+                            raw_result = f"No chat history found for {chat_title}."
+                        self._log("web-fetch", round=_round + 1, method="read_chat_history", chat_title=chat_title, limit=limit, result_len=len(raw_result))
+                        web_results.append((f"[chat_history] {chat_title} limit={limit}", raw_result[:6000]))
                 elif kind == "read_impression":
                     name = re.sub(r"_[0-9a-f]{8}$", "", str(action.get("name", "") or "").strip())
                     if name:
@@ -366,8 +380,10 @@ class AutoSpeakBot:
                 else:
                     kept.append(action)
             if not web_results:
-                self._log("web-rounds-end", total_rounds=_round, final_action_count=len(kept))
-                return kept
+                final = self._finalize_if_needed(kept, original_title, original_text, original_sender, tool_trace)
+                self._log("web-rounds-end", total_rounds=_round, final_action_count=len(final))
+                return final
+            tool_trace.extend(web_results)
             combined = "\n\n".join(f"{label}\n{content}" for label, content in web_results)
             self._log("web-feed-prompt", round=_round + 1, prompt_len=len(combined))
             origin_hint = ""
@@ -378,7 +394,8 @@ class AutoSpeakBot:
                 text=f"Tool action results (round {_round + 1}):\n{combined}\n\n"
                      f"Original chat: {original_title}\n"
                      f"When sending messages, use this exact chat title.\n"
-                     f"If a web result shows failure or no data, try a DIFFERENT search method (search_web / search_web_volc / search_web_brave / fetch_url / browse_url) before giving up. "
+                     f"Use read_chat_history to inspect recent WeChat context; do not guess local message file paths. "
+                     f"If a web result shows failure or no data, try a DIFFERENT search method (search_web / search_web_volc / search_web_brave / fetch_url / browse_url / read_chat_history) before giving up. "
                      f"Based on these results, use the registered tools to take further actions, update memory/impressions, or reply."
                      f"{origin_hint}",
                 sender="system",
@@ -389,10 +406,49 @@ class AutoSpeakBot:
                 current = result.actions + kept
             except AgentError as exc:
                 self._log("web-result-error", round=_round + 1, error=str(exc))
-                self._log("web-rounds-end", total_rounds=_round + 1, final_action_count=len(kept))
-                return kept
-        self._log("web-rounds-end", total_rounds=max_rounds, final_action_count=len(current))
-        return current
+                final = self._finalize_if_needed(kept, original_title, original_text, original_sender, tool_trace)
+                self._log("web-rounds-end", total_rounds=_round + 1, final_action_count=len(final))
+                return final
+        final = self._finalize_if_needed(current, original_title, original_text, original_sender, tool_trace)
+        self._log("web-rounds-end", total_rounds=max_rounds, final_action_count=len(final))
+        return final
+
+    def _finalize_if_needed(
+        self,
+        actions: list[dict[str, Any]],
+        original_title: str,
+        original_text: str,
+        original_sender: str,
+        tool_trace: list[tuple[str, str]],
+    ) -> list[dict[str, Any]]:
+        if any(a.get("type") in {"send_message", "send_image", "noop"} for a in actions):
+            return actions
+        if not self._requires_final_response(original_title, original_text, original_sender):
+            return actions
+        trace_text = "\n\n".join(f"{label}\n{content}" for label, content in tool_trace)[-12000:]
+        self._log("web-finalize-start", original_title=original_title, trace_len=len(trace_text))
+        try:
+            result = self.agent.finalize_response(
+                chat_title=original_title,
+                original_sender=original_sender,
+                original_text=original_text,
+                tool_trace=trace_text,
+            )
+            self._log("web-finalize-result", action_count=len(result.actions), actions=result.actions, raw_preview=result.raw_response[:300])
+            return result.actions
+        except AgentError as exc:
+            self._log("web-finalize-error", error=str(exc))
+            return [{"type": "send_message", "title": original_title, "message": "我这边没拿到原链接或视频内容，刚刚查漏了。"}]
+
+    def _requires_final_response(self, original_title: str, original_text: str, original_sender: str) -> bool:
+        if not original_title:
+            return False
+        if not self._is_group(original_title):
+            return True
+        haystack = f"{original_sender} {original_text}"
+        if any(keyword in haystack for keyword in self.cfg.group_reply_keywords):
+            return True
+        return "@" in original_text
 
     def _proxy_args(self, use_proxy: bool) -> tuple[list[str], dict[str, str]]:
         p = self.cfg.proxy

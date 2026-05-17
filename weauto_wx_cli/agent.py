@@ -137,6 +137,20 @@ ACTION_TOOL_SPECS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "read_chat_history",
+            "description": "Read recent WeChat chat history for a chat. Use this instead of guessing local message file paths.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chat_title": {"type": "string", "description": "Exact WeChat chat title. Defaults to the inbound chat when omitted."},
+                    "limit": {"type": "integer", "description": "Number of recent messages to read, between 1 and 100."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "write_impression",
             "description": "Replace a person's stored impression.",
             "parameters": {
@@ -245,6 +259,11 @@ ACTION_TOOL_SPECS: list[dict[str, Any]] = [
             },
         },
     },
+]
+
+FINAL_ACTION_TOOL_SPECS: list[dict[str, Any]] = [
+    spec for spec in ACTION_TOOL_SPECS
+    if spec.get("function", {}).get("name") in {"send_message", "noop"}
 ]
 
 
@@ -484,7 +503,7 @@ class Agent:
 
         if msg and msg.chat_title:
             try:
-                history = self._get_history(msg.chat_title, limit=10)
+                history = self._get_history(msg.chat_title, limit=50)
                 if history:
                     parts.append(f"[recent chat history - {msg.chat_title}]\n{history}")
             except Exception:
@@ -656,9 +675,15 @@ class Agent:
         messages: list[dict[str, Any]],
         allow_internal: bool = False,
         default_title: str = "",
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = "auto",
     ) -> AgentResult:
         try:
-            choice = self._main_llm.chat(messages, tools=ACTION_TOOL_SPECS, tool_choice="auto")
+            choice = self._main_llm.chat(
+                messages,
+                tools=ACTION_TOOL_SPECS if tools is None else tools,
+                tool_choice=tool_choice,
+            )
         except AgentError as exc:
             raise
         raw_response = json.dumps(choice, ensure_ascii=False)
@@ -672,6 +697,60 @@ class Agent:
         for a in actions:
             self._execute_internal_action(a)
         return AgentResult(actions=actions, raw_response=raw_response)
+
+    def finalize_response(
+        self,
+        *,
+        chat_title: str,
+        original_sender: str = "",
+        original_text: str = "",
+        tool_trace: str = "",
+    ) -> AgentResult:
+        prompt = (
+            "You are finalizing a WeChat reply after tool use. "
+            "Call exactly one registered tool: send_message or noop. "
+            "Do not answer in ordinary assistant content. "
+            "If the user directly asked or mentioned you, prefer send_message; if the available data is insufficient, say that plainly."
+        )
+        user = (
+            f"Original chat: {chat_title}\n"
+            f"Original sender: {original_sender}\n"
+            f"Original message: {original_text}\n\n"
+            f"Tool results and attempts:\n{tool_trace or '[none]'}\n\n"
+            "Finalize now with exactly one tool call."
+        )
+        result = self._call_llm(
+            [{"role": "system", "content": prompt}, {"role": "user", "content": user}],
+            default_title=chat_title,
+            tools=FINAL_ACTION_TOOL_SPECS,
+            tool_choice="required",
+        )
+        final_actions = [a for a in result.actions if a.get("type") in {"send_message", "noop"}]
+        if final_actions:
+            return AgentResult(actions=final_actions[:1], raw_response=result.raw_response)
+
+        content = self._raw_message_content(result.raw_response).strip()
+        if content:
+            return AgentResult(
+                actions=[{"type": "send_message", "title": chat_title, "message": content}],
+                raw_response=result.raw_response,
+            )
+        return AgentResult(
+            actions=[{"type": "send_message", "title": chat_title, "message": "我这边没拿到原链接或视频内容，刚刚查漏了。"}],
+            raw_response=result.raw_response,
+        )
+
+    @staticmethod
+    def _raw_message_content(raw_response: str) -> str:
+        try:
+            parsed = json.loads(raw_response)
+        except Exception:
+            return ""
+        msg = parsed.get("message", {}) if isinstance(parsed, dict) else {}
+        content = msg.get("content", "") if isinstance(msg, dict) else ""
+        if isinstance(content, str):
+            return content
+        return json.dumps(content, ensure_ascii=False) if content else ""
 
     def _execute_internal_action(self, action: dict[str, Any]) -> None:
         kind = str(action.get("type") or "").strip()
@@ -896,6 +975,7 @@ class Agent:
             "none": "noop",
             "write_memory": "write_memory", "write_skill": "write_skill", "write_impression": "write_impression",
             "read_impression": "read_impression", "read_person": "read_impression", "read_people": "read_impression",
+            "read_chat_history": "read_chat_history", "chat_history": "read_chat_history", "read_history": "read_chat_history",
         }
         kind = aliases.get(raw_type, raw_type)
         if not kind and (item.get("message") or item.get("text")):
@@ -905,6 +985,17 @@ class Agent:
         if kind == "read_impression":
             name = str(item.get("name", "") or item.get("person", "") or item.get("canonical_name", "")).strip()
             return {"type": "read_impression", "name": name} if name else None
+        if kind == "read_chat_history":
+            title = str(item.get("chat_title") or item.get("title") or default_title).strip()
+            result: dict[str, Any] = {"type": "read_chat_history"}
+            if title:
+                result["chat_title"] = title
+            try:
+                limit = int(item.get("limit", 50))
+            except (TypeError, ValueError):
+                limit = 50
+            result["limit"] = max(1, min(100, limit))
+            return result
         if kind == "delete_skill":
             name = str(item.get("name", "")).strip()
             return {"type": "delete_skill", "name": name} if name else None
