@@ -252,6 +252,9 @@ Supported actions:
 
 - `send_message`: `{"type":"send_message","title":"会话名","message":"内容"}`
 - `send_image`: `{"type":"send_image","title":"会话名","image_path":"/local/file.png"}`
+- `generate_image`: `{"type":"generate_image","title":"会话名","prompt":"图片描述","size":"1024x1024"}`
+- `edit_image`: `{"type":"edit_image","title":"会话名","prompt":"把图片改成水彩风格","image_path":"/local/source.png"}`. For an inbound WeChat image, `image_path` can be omitted and the first resolved image attachment is used.
+- `run_python`: `{"type":"run_python","code":"print(round(7 / 3, 2))"}` for sandboxed calculations only.
 - `focus_chat`: `{"type":"focus_chat","title":"会话名"}`
 - `noop`: `{"type":"noop"}`
 
@@ -333,9 +336,10 @@ The adapter therefore handles images conservatively:
   `raw.local_id` is set, and the original `raw` JSON.
 - Hermes is told that an image attachment without `path` or `url` is metadata
   only, so it should not claim to have seen the image content.
-- If later we resolve WeChat's cached image file path from `local_id`, that
-  resolver should be added in `weauto_wx_cli.wx_cli` before the event is sent to
-  Hermes.
+- If WeChat's cached image file path is resolved from `local_id`, the agent can
+  use `edit_image(prompt)` to submit that local image to Bailian as Base64,
+  download the edited result into `data/edited_images`, and send it back through
+  the existing GUI image sender.
 
 ## Files Added
 
@@ -347,6 +351,8 @@ The adapter therefore handles images conservatively:
 - `weauto_wx_cli/detector.py`: visible chat row OCR and title matching.
 - `weauto_wx_cli/reply.py`: legacy template/command reply generation for
   `processing_mode = "template"` smoke tests.
+- `weauto_wx_cli/image_editing.py`: Bailian/DashScope image editing client for
+  inbound WeChat images.
 - `weauto_wx_cli/bot.py`: polling, filtering, dedupe, and dispatch loop.
 - `weauto_wx_cli/cli.py`: command line entrypoint.
 - `config.toml.example`: default runtime configuration.
@@ -428,6 +434,12 @@ Logs are written to `logs/YYYYMMDD_HHMMSS_<command>.log`. `logs/latest.log`
 points at the latest non-`logs` command run. The bot logs structured JSON lines
 for incoming messages, skip reasons, Hermes results, action execution, and send
 errors so a failed turn can be debugged from one file.
+
+`./start_bot.sh` also shows a compact terminal view by default. The terminal
+view hides the structured JSON lines and colors the human-readable summaries
+such as `[msg]`, `[agent]`, `[tool]`, and `[sent]`; the log file still receives
+the original complete stream. Set `WEAUTO_TERMINAL_JSON=1` to show JSON in the
+terminal too, or `WEAUTO_PRETTY_LOGS=0` to go back to plain `tee` output.
 
 Only set `dry_run = false` after:
 

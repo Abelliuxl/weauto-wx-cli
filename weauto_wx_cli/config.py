@@ -49,6 +49,39 @@ class ProxyConfig:
 
 
 @dataclass
+class ImageGenerationConfig:
+    enabled: bool = False
+    provider: str = "dashscope_z_image"
+    base_url: str = "https://dashscope.aliyuncs.com/api/v1/services/aigc"
+    base_url_env: str = "DASHSCOPE_BASE_URL"
+    api_key: str = ""
+    api_key_env: str = "DASHSCOPE_API_KEY"
+    model: str = "z-image-turbo"
+    timeout_sec: float = 90.0
+    download_timeout_sec: float = 45.0
+    default_size: str = "1024x1024"
+    output_dir: str = "data/generated_images"
+
+
+@dataclass
+class ImageEditingConfig:
+    enabled: bool = False
+    provider: str = "dashscope_qwen_image_edit"
+    base_url: str = "https://dashscope.aliyuncs.com/api/v1/services/aigc"
+    base_url_env: str = "DASHSCOPE_BASE_URL"
+    api_key: str = ""
+    api_key_env: str = "DASHSCOPE_API_KEY"
+    model: str = "qwen-image-2.0-pro"
+    timeout_sec: float = 120.0
+    download_timeout_sec: float = 45.0
+    default_size: str = ""
+    output_dir: str = "data/edited_images"
+    watermark: bool = False
+    prompt_extend: bool = True
+    max_input_bytes: int = 10 * 1024 * 1024
+
+
+@dataclass
 class MainLLMConfig:
     api_key: str = ""
     api_key_env: str = "LLM_API_KEY"
@@ -56,6 +89,7 @@ class MainLLMConfig:
     base_url: str = "https://api.openai.com/v1"
     timeout_sec: float = 60.0
     max_tokens: int = 4096
+    temperature: float | None = 0.0
 
 
 @dataclass
@@ -66,6 +100,18 @@ class VisionLLMConfig:
     base_url: str = "https://api.openai.com/v1"
     timeout_sec: float = 30.0
     max_tokens: int = 1024
+    temperature: float | None = None
+
+
+@dataclass
+class ReplyLLMConfig:
+    api_key: str = ""
+    api_key_env: str = "LLM_API_KEY"
+    model: str = "gpt-4o"
+    base_url: str = "https://api.openai.com/v1"
+    timeout_sec: float = 60.0
+    max_tokens: int = 2048
+    temperature: float | None = 0.7
 
 
 @dataclass
@@ -76,7 +122,9 @@ class AgentConfig:
         "Prefer tool calls over writing JSON in message text. "
         "If tool calls are unavailable, return JSON with shape {\"actions\":[...]}. "
         "Supported action types: send_message (title+message), "
-        "send_image (title+image_path), focus_chat (title), noop, "
+        "send_image (title+image_path), generate_image (title+prompt+optional size, when available), "
+        "edit_image (title+prompt+optional image_path/image_url/size, when available; omit image_path for current image), "
+        "focus_chat (title), noop, "
         "write_memory (name+content) — replace one memory file; name must be core or timeline. "
         "Use core for stable preferences/rules/facts; use timeline for dated events and recent activity. "
         "write_skill (name+content) — save a reusable procedure/strategy (use clear name). "
@@ -84,6 +132,7 @@ class AgentConfig:
         "write_impression (name+content) — full replace, canonical name only. "
         "read_impression (name) — read one person's impression when needed before replying or updating it. "
         "People impressions are not loaded by default; request only relevant people. "
+        "The event sender_identity canonical_name is authoritative for identity; prefer it over raw wx IDs or older chat-history guesses. "
         "Your agent memory is data/memory/core.md and data/memory/timeline.md; "
         "data/people/*.md stores person impressions, not your own agent memory. "
         "If a web action fails or returns no data, try a different search method. "
@@ -94,10 +143,15 @@ class AgentConfig:
         "search_web_volc (query) — Doubao LLM-powered web search (Volcengine Ark). "
         "browse_url (url, proxy=true/false) — Playwright browser, returns rendered page text. "
         "read_chat_history (chat_title, limit) — read recent WeChat chat history; use this instead of guessing local message file paths. "
+        "run_python (code) — sandboxed Python for math/statistics/date calculations only; print the result. "
+        "build_wow_character_url (character/server or player/class_name) — use data/skills/wow-character-link to build WoW CN character links; do not use run_python for URL encoding. "
         "read_file (path) — read a file inside the project directory. "
         "list_files (pattern) — list files matching a glob pattern (e.g. data/**/*.md). "
         "Set proxy=false for domestic sites, proxy=true for international sites that need the proxy. "
-        "Use the inbound chat_title as title unless routing elsewhere."
+        "Use the inbound chat_title as title unless routing elsewhere. "
+        "WeChat does not render Markdown; send plain text only. "
+        "Do not use Markdown headings, bold/italic markers, blockquotes, tables, code fences, or bullet stars. "
+        "Numbered lists such as 1. 2. 3. are okay when a list is genuinely useful."
     )
     identity_text: str = ""
     identity_path: str = "data/identity.md"
@@ -106,6 +160,7 @@ class AgentConfig:
     heartbeat_interval_sec: float = 300.0
     main: MainLLMConfig = field(default_factory=MainLLMConfig)
     vision: VisionLLMConfig = field(default_factory=VisionLLMConfig)
+    reply: ReplyLLMConfig = field(default_factory=ReplyLLMConfig)
 
 
 @dataclass
@@ -171,6 +226,8 @@ class AppConfig:
     manual_rows: ManualRowsConfig = field(default_factory=ManualRowsConfig)
     people: PeopleConfig = field(default_factory=PeopleConfig)
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
+    image_generation: ImageGenerationConfig = field(default_factory=ImageGenerationConfig)
+    image_editing: ImageEditingConfig = field(default_factory=ImageEditingConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
 
     tavily_api_key: str = ""
@@ -210,6 +267,17 @@ def _str_list(raw: object) -> list[str]:
     if not isinstance(raw, list):
         return []
     return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def _load_image_generation_provider(raw: object, default: str = "dashscope_z_image") -> str:
+    value = str(raw if raw is not None else default).strip().lower()
+    if value in ("openai", "openai_compat", "openai-compatible"):
+        return "openai_compat"
+    if value in ("dashscope", "dashscope_z_image", "dashscope-z-image", "aliyun", "bailian"):
+        return "dashscope_z_image"
+    if value != default:
+        return _load_image_generation_provider(default, "dashscope_z_image")
+    return "dashscope_z_image"
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -337,6 +405,125 @@ def load_config(path: str | Path) -> AppConfig:
             no_proxy=str(proxy_raw.get("no_proxy", cfg.proxy.no_proxy)),
         )
 
+    image_gen_raw = data.get("image_generation", {})
+    if isinstance(image_gen_raw, dict):
+        image_gen_base_url = str(
+            image_gen_raw.get("base_url", cfg.image_generation.base_url)
+        ).strip().rstrip("/")
+        image_gen_base_url_env = str(
+            image_gen_raw.get("base_url_env", cfg.image_generation.base_url_env)
+        ).strip()
+        if (not image_gen_base_url) and image_gen_base_url_env:
+            image_gen_base_url = os.getenv(image_gen_base_url_env, "").strip().rstrip("/")
+        cfg.image_generation = ImageGenerationConfig(
+            enabled=bool(image_gen_raw.get("enabled", cfg.image_generation.enabled)),
+            provider=_load_image_generation_provider(
+                image_gen_raw.get("provider", cfg.image_generation.provider),
+                cfg.image_generation.provider,
+            ),
+            base_url=image_gen_base_url,
+            base_url_env=image_gen_base_url_env,
+            api_key=str(image_gen_raw.get("api_key", cfg.image_generation.api_key)),
+            api_key_env=str(image_gen_raw.get("api_key_env", cfg.image_generation.api_key_env)),
+            model=str(image_gen_raw.get("model", cfg.image_generation.model)).strip(),
+            timeout_sec=float(image_gen_raw.get("timeout_sec", cfg.image_generation.timeout_sec)),
+            download_timeout_sec=float(
+                image_gen_raw.get(
+                    "download_timeout_sec",
+                    cfg.image_generation.download_timeout_sec,
+                )
+            ),
+            default_size=str(
+                image_gen_raw.get("default_size", cfg.image_generation.default_size)
+            ).strip(),
+            output_dir=str(
+                image_gen_raw.get("output_dir", cfg.image_generation.output_dir)
+            ).strip(),
+        )
+        if not cfg.image_generation.base_url:
+            cfg.image_generation.base_url = "https://dashscope.aliyuncs.com/api/v1/services/aigc"
+        if not cfg.image_generation.model:
+            cfg.image_generation.model = "z-image-turbo"
+        if not cfg.image_generation.default_size:
+            cfg.image_generation.default_size = "1024x1024"
+        if not cfg.image_generation.output_dir:
+            cfg.image_generation.output_dir = "data/generated_images"
+        if cfg.image_generation.timeout_sec < 5.0:
+            cfg.image_generation.timeout_sec = 5.0
+        if cfg.image_generation.download_timeout_sec < 5.0:
+            cfg.image_generation.download_timeout_sec = 5.0
+
+    image_edit_present = isinstance(data.get("image_editing"), dict)
+    image_edit_raw = data.get("image_editing", {}) if image_edit_present else {}
+    if isinstance(image_edit_raw, dict):
+        image_edit_base_url = str(
+            image_edit_raw.get("base_url", cfg.image_generation.base_url or cfg.image_editing.base_url)
+        ).strip().rstrip("/")
+        image_edit_base_url_env = str(
+            image_edit_raw.get(
+                "base_url_env",
+                cfg.image_generation.base_url_env or cfg.image_editing.base_url_env,
+            )
+        ).strip()
+        if (not image_edit_base_url) and image_edit_base_url_env:
+            image_edit_base_url = os.getenv(image_edit_base_url_env, "").strip().rstrip("/")
+        cfg.image_editing = ImageEditingConfig(
+            enabled=bool(
+                image_edit_raw.get(
+                    "enabled",
+                    cfg.image_editing.enabled if image_edit_present else cfg.image_generation.enabled,
+                )
+            ),
+            provider=str(
+                image_edit_raw.get("provider", cfg.image_editing.provider)
+            ).strip().lower()
+            or "dashscope_qwen_image_edit",
+            base_url=image_edit_base_url,
+            base_url_env=image_edit_base_url_env,
+            api_key=str(
+                image_edit_raw.get("api_key", cfg.image_generation.api_key or cfg.image_editing.api_key)
+            ),
+            api_key_env=str(
+                image_edit_raw.get(
+                    "api_key_env",
+                    cfg.image_generation.api_key_env or cfg.image_editing.api_key_env,
+                )
+            ),
+            model=str(image_edit_raw.get("model", cfg.image_editing.model)).strip(),
+            timeout_sec=float(image_edit_raw.get("timeout_sec", cfg.image_editing.timeout_sec)),
+            download_timeout_sec=float(
+                image_edit_raw.get(
+                    "download_timeout_sec",
+                    cfg.image_editing.download_timeout_sec,
+                )
+            ),
+            default_size=str(
+                image_edit_raw.get("default_size", cfg.image_editing.default_size)
+            ).strip(),
+            output_dir=str(
+                image_edit_raw.get("output_dir", cfg.image_editing.output_dir)
+            ).strip(),
+            watermark=bool(image_edit_raw.get("watermark", cfg.image_editing.watermark)),
+            prompt_extend=bool(
+                image_edit_raw.get("prompt_extend", cfg.image_editing.prompt_extend)
+            ),
+            max_input_bytes=int(
+                image_edit_raw.get("max_input_bytes", cfg.image_editing.max_input_bytes)
+            ),
+        )
+        if not cfg.image_editing.base_url:
+            cfg.image_editing.base_url = "https://dashscope.aliyuncs.com/api/v1/services/aigc"
+        if not cfg.image_editing.model:
+            cfg.image_editing.model = "qwen-image-2.0-pro"
+        if not cfg.image_editing.output_dir:
+            cfg.image_editing.output_dir = "data/edited_images"
+        if cfg.image_editing.timeout_sec < 5.0:
+            cfg.image_editing.timeout_sec = 5.0
+        if cfg.image_editing.download_timeout_sec < 5.0:
+            cfg.image_editing.download_timeout_sec = 5.0
+        if cfg.image_editing.max_input_bytes <= 0:
+            cfg.image_editing.max_input_bytes = 10 * 1024 * 1024
+
     unread_raw = data.get("unread_badge", {})
     if isinstance(unread_raw, dict):
         cfg.unread_badge = UnreadBadgeConfig(
@@ -358,6 +545,7 @@ def load_config(path: str | Path) -> AppConfig:
     if isinstance(agent_raw, dict):
         main_raw = agent_raw.get("main", {})
         vision_raw = agent_raw.get("vision", {})
+        reply_raw = agent_raw.get("reply", {})
 
         def _ak(raw_sec: object, default_key: str) -> str:
             if isinstance(raw_sec, dict):
@@ -368,6 +556,14 @@ def load_config(path: str | Path) -> AppConfig:
             if isinstance(raw_sec, dict):
                 return str(raw_sec.get("api_key_env", default_env) or "")
             return default_env
+
+        def _temp(raw_sec: object, default: float | None) -> float | None:
+            if not isinstance(raw_sec, dict) or "temperature" not in raw_sec:
+                return default
+            value = raw_sec.get("temperature")
+            if value is None:
+                return None
+            return float(value)
 
         cfg.agent = AgentConfig(
             enabled=bool(agent_raw.get("enabled", cfg.agent.enabled)),
@@ -384,6 +580,7 @@ def load_config(path: str | Path) -> AppConfig:
                 base_url=str(main_raw.get("base_url", cfg.agent.main.base_url)) if isinstance(main_raw, dict) else cfg.agent.main.base_url,
                 timeout_sec=float(main_raw.get("timeout_sec", cfg.agent.main.timeout_sec)) if isinstance(main_raw, dict) else cfg.agent.main.timeout_sec,
                 max_tokens=int(main_raw.get("max_tokens", cfg.agent.main.max_tokens)) if isinstance(main_raw, dict) else cfg.agent.main.max_tokens,
+                temperature=_temp(main_raw, cfg.agent.main.temperature),
             ),
             vision=VisionLLMConfig(
                 api_key=_ak(vision_raw, cfg.agent.vision.api_key),
@@ -392,6 +589,16 @@ def load_config(path: str | Path) -> AppConfig:
                 base_url=str(vision_raw.get("base_url", cfg.agent.vision.base_url)) if isinstance(vision_raw, dict) else cfg.agent.vision.base_url,
                 timeout_sec=float(vision_raw.get("timeout_sec", cfg.agent.vision.timeout_sec)) if isinstance(vision_raw, dict) else cfg.agent.vision.timeout_sec,
                 max_tokens=int(vision_raw.get("max_tokens", cfg.agent.vision.max_tokens)) if isinstance(vision_raw, dict) else cfg.agent.vision.max_tokens,
+                temperature=_temp(vision_raw, cfg.agent.vision.temperature),
+            ),
+            reply=ReplyLLMConfig(
+                api_key=_ak(reply_raw, cfg.agent.reply.api_key),
+                api_key_env=_ake(reply_raw, cfg.agent.reply.api_key_env),
+                model=str(reply_raw.get("model", cfg.agent.reply.model)) if isinstance(reply_raw, dict) else cfg.agent.reply.model,
+                base_url=str(reply_raw.get("base_url", cfg.agent.reply.base_url)) if isinstance(reply_raw, dict) else cfg.agent.reply.base_url,
+                timeout_sec=float(reply_raw.get("timeout_sec", cfg.agent.reply.timeout_sec)) if isinstance(reply_raw, dict) else cfg.agent.reply.timeout_sec,
+                max_tokens=int(reply_raw.get("max_tokens", cfg.agent.reply.max_tokens)) if isinstance(reply_raw, dict) else cfg.agent.reply.max_tokens,
+                temperature=_temp(reply_raw, cfg.agent.reply.temperature),
             ),
         )
 

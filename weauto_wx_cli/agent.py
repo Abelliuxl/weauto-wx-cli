@@ -12,7 +12,8 @@ from urllib import request as urllib_request
 from urllib.parse import urlparse
 
 from .agent_store import ChatHistoryStore, HotFile, MemoryStore, PeopleStore, SkillStore
-from .config import AppConfig, MainLLMConfig, VisionLLMConfig
+from .config import AppConfig, MainLLMConfig, ReplyLLMConfig, VisionLLMConfig
+from .image_generation import ImageGenerator
 from .models import WxMessage
 from .people import PeopleContextBuilder
 
@@ -55,6 +56,50 @@ ACTION_TOOL_SPECS: list[dict[str, Any]] = [
                     "image_path": {"type": "string", "description": "Local image path."},
                 },
                 "required": ["title", "image_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image",
+            "description": "Generate an image from a prompt and send it to a WeChat chat.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Exact WeChat chat title."},
+                    "prompt": {"type": "string", "description": "Specific image prompt, <= 280 chars."},
+                    "size": {"type": "string", "description": "Optional image size such as 1024x1024."},
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_image",
+            "description": (
+                "Edit the inbound/current image with an instruction and send the result to a WeChat chat. "
+                "Use this when the user asks to modify, restyle, retouch, add/remove content, or enhance an image. "
+                "Omit image_path when editing the image attached to the current message."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Exact WeChat chat title."},
+                    "prompt": {"type": "string", "description": "Specific edit instruction, <= 800 chars."},
+                    "image_path": {
+                        "type": "string",
+                        "description": "Optional local source image path. Omit for the current message image.",
+                    },
+                    "image_url": {
+                        "type": "string",
+                        "description": "Optional public source image URL. Usually omit for WeChat images.",
+                    },
+                    "size": {"type": "string", "description": "Optional output size such as 1024x1024."},
+                },
+                "required": ["prompt"],
             },
         },
     },
@@ -144,6 +189,49 @@ ACTION_TOOL_SPECS: list[dict[str, Any]] = [
                 "properties": {
                     "chat_title": {"type": "string", "description": "Exact WeChat chat title. Defaults to the inbound chat when omitted."},
                     "limit": {"type": "integer", "description": "Number of recent messages to read, between 1 and 100."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_python",
+            "description": (
+                "Run short, sandboxed Python only for math, statistics, date/time arithmetic, "
+                "or unit conversion. Do not use for URL building, percent-encoding, web links, "
+                "file lookup, or skill-table lookup. Print the result. "
+                "No imports, files, network, eval/exec/open, or system access."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Short Python calculation code. Use print(...) for outputs.",
+                    }
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "build_wow_character_url",
+            "description": (
+                "Build an official WoW CN character page URL using the modular "
+                "data/skills/wow-character-link skill. Use this for 魔兽/WoW角色页面/角色主页/玩家某职业角色. "
+                "Do not use run_python for this task."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "WeChat chat title. Defaults to inbound chat."},
+                    "character": {"type": "string", "description": "Exact character name, if known."},
+                    "server": {"type": "string", "description": "Chinese server name or realm slug, if known."},
+                    "player": {"type": "string", "description": "Player name or alias, e.g. 吴松竹 or 吴工."},
+                    "class_name": {"type": "string", "description": "Class/job under the player, e.g. 战士."},
                 },
             },
         },
@@ -261,22 +349,17 @@ ACTION_TOOL_SPECS: list[dict[str, Any]] = [
     },
 ]
 
-FINAL_ACTION_TOOL_SPECS: list[dict[str, Any]] = [
-    spec for spec in ACTION_TOOL_SPECS
-    if spec.get("function", {}).get("name") in {"send_message", "noop"}
-]
-
-
 class LLMClient:
-    def __init__(self, cfg: MainLLMConfig | VisionLLMConfig) -> None:
+    def __init__(self, cfg: MainLLMConfig | VisionLLMConfig | ReplyLLMConfig) -> None:
         self.api_key = cfg.api_key or os.environ.get(cfg.api_key_env or "", "") or ""
         self.model = cfg.model
         self.timeout_sec = cfg.timeout_sec
         self.max_tokens = cfg.max_tokens
+        self.temperature = cfg.temperature
         self.base_url = self._resolve_base_url(cfg)
 
     @staticmethod
-    def _resolve_base_url(cfg: MainLLMConfig | VisionLLMConfig) -> str:
+    def _resolve_base_url(cfg: MainLLMConfig | VisionLLMConfig | ReplyLLMConfig) -> str:
         env_key = cfg.api_key_env or ""
         env_base_var = f"{env_key.split('_', 1)[0]}_BASE_URL" if "_" in env_key else ""
         if cfg.base_url:
@@ -305,6 +388,8 @@ class LLMClient:
         response_format: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"model": self.model, "messages": messages, "max_tokens": self.max_tokens, "stream": False}
+        if self.temperature is not None:
+            body["temperature"] = self.temperature
         if tools:
             body["tools"] = tools
         if tool_choice:
@@ -340,6 +425,7 @@ class Agent:
         self.cfg = cfg
         self._main_llm = LLMClient(cfg.agent.main)
         self._vision_llm = LLMClient(cfg.agent.vision)
+        self._reply_llm = LLMClient(cfg.agent.reply)
         self._people_builder: PeopleContextBuilder | None = None
         self.memory = MemoryStore()
         self.skills = SkillStore()
@@ -422,7 +508,18 @@ class Agent:
         vision_note = self._pre_analyze_images(msg)
         context = self._build_context(msg)
         messages = self._build_messages(payload, context, vision_note)
-        return self._call_llm(messages, default_title=msg.chat_title)
+        result = self._call_llm(messages, default_title=msg.chat_title)
+        if not result.actions:
+            planner_content = self._raw_message_content(result.raw_response).strip()
+            if planner_content:
+                return self.compose_reply(
+                    chat_title=msg.chat_title,
+                    original_sender=sender,
+                    original_text=msg.text,
+                    planner_content=planner_content,
+                    context=context,
+                )
+        return result
 
     # ── Heartbeat ─────────────────────────────────────────────────
 
@@ -670,6 +767,19 @@ class Agent:
 
     # ── LLM call ──────────────────────────────────────────────────
 
+    def _available_tool_specs(self) -> list[dict[str, Any]]:
+        image_tool_enabled = bool(self.cfg.image_generation.enabled)
+        image_edit_tool_enabled = bool(self.cfg.image_editing.enabled)
+        specs: list[dict[str, Any]] = []
+        for spec in ACTION_TOOL_SPECS:
+            name = str(spec.get("function", {}).get("name") or "")
+            if name == "generate_image" and not image_tool_enabled:
+                continue
+            if name == "edit_image" and not image_edit_tool_enabled:
+                continue
+            specs.append(spec)
+        return specs
+
     def _call_llm(
         self,
         messages: list[dict[str, Any]],
@@ -681,7 +791,7 @@ class Agent:
         try:
             choice = self._main_llm.chat(
                 messages,
-                tools=ACTION_TOOL_SPECS if tools is None else tools,
+                tools=self._available_tool_specs() if tools is None else tools,
                 tool_choice=tool_choice,
             )
         except AgentError as exc:
@@ -706,38 +816,57 @@ class Agent:
         original_text: str = "",
         tool_trace: str = "",
     ) -> AgentResult:
-        prompt = (
-            "You are finalizing a WeChat reply after tool use. "
-            "Call exactly one registered tool: send_message or noop. "
-            "Do not answer in ordinary assistant content. "
-            "If the user directly asked or mentioned you, prefer send_message; if the available data is insufficient, say that plainly."
+        return self.compose_reply(
+            chat_title=chat_title,
+            original_sender=original_sender,
+            original_text=original_text,
+            tool_trace=tool_trace,
         )
+
+    def compose_reply(
+        self,
+        *,
+        chat_title: str,
+        original_sender: str = "",
+        original_text: str = "",
+        planner_content: str = "",
+        tool_trace: str = "",
+        context: str = "",
+    ) -> AgentResult:
+        prompt = (
+            "You are the dedicated WeChat reply writer. "
+            "The agent/planner has already gathered context and facts. "
+            "Write only the final message text to send. Do not call tools. "
+            "Use the configured identity/personality. Keep it natural, short, and WeChat-like. "
+            "Use plain text only: no Markdown headings, bold/italic markers, blockquotes, tables, code fences, or bullet stars. "
+            "Avoid underscores and dash-like punctuation; they feel too AI-written in WeChat. "
+            "Numbered lists such as 1. 2. 3. are okay only when genuinely useful. "
+            "If the available information is insufficient, say that plainly instead of inventing details."
+        )
+        identity = self._identity()
         user = (
             f"Original chat: {chat_title}\n"
             f"Original sender: {original_sender}\n"
             f"Original message: {original_text}\n\n"
+            f"Planner notes / draft:\n{planner_content or '[none]'}\n\n"
             f"Tool results and attempts:\n{tool_trace or '[none]'}\n\n"
-            "Finalize now with exactly one tool call."
+            f"Recent context:\n{context[-8000:] if context else '[none]'}"
         )
-        result = self._call_llm(
-            [{"role": "system", "content": prompt}, {"role": "user", "content": user}],
-            default_title=chat_title,
-            tools=FINAL_ACTION_TOOL_SPECS,
-            tool_choice="required",
-        )
-        final_actions = [a for a in result.actions if a.get("type") in {"send_message", "noop"}]
-        if final_actions:
-            return AgentResult(actions=final_actions[:1], raw_response=result.raw_response)
-
-        content = self._raw_message_content(result.raw_response).strip()
+        system_parts = [prompt]
+        if identity:
+            system_parts.append(f"[identity]\n{identity}")
+        messages = [{"role": "system", "content": "\n\n".join(system_parts)}, {"role": "user", "content": user}]
+        choice = self._reply_llm.chat(messages, tools=None, tool_choice=None)
+        raw_response = json.dumps(choice, ensure_ascii=False)
+        content = self._raw_message_content(raw_response).strip()
         if content:
             return AgentResult(
                 actions=[{"type": "send_message", "title": chat_title, "message": content}],
-                raw_response=result.raw_response,
+                raw_response=raw_response,
             )
         return AgentResult(
             actions=[{"type": "send_message", "title": chat_title, "message": "我这边没拿到原链接或视频内容，刚刚查漏了。"}],
-            raw_response=result.raw_response,
+            raw_response=raw_response,
         )
 
     @staticmethod
@@ -857,10 +986,27 @@ class Agent:
                 actions.append({"type": "send_message", "title": title, "message": args["message"]})
             elif kind == "send_image" and args.get("image_path"):
                 actions.append({"type": "send_image", "title": title, "image_path": args["image_path"]})
+            elif kind == "generate_image" and args.get("prompt"):
+                action: dict[str, Any] = {"type": "generate_image", "title": title, "prompt": args["prompt"]}
+                if args.get("size"):
+                    action["size"] = args["size"]
+                actions.append(action)
+            elif kind in {"edit_image", "image_edit", "modify_image"} and args.get("prompt"):
+                action = {"type": "edit_image", "title": title, "prompt": args["prompt"]}
+                if args.get("image_path"):
+                    action["image_path"] = args["image_path"]
+                if args.get("image_url"):
+                    action["image_url"] = args["image_url"]
+                if args.get("size"):
+                    action["size"] = args["size"]
+                actions.append(action)
             elif kind == "focus_chat":
                 actions.append({"type": "focus_chat", "title": title})
             elif kind == "read_impression" and args.get("name"):
                 actions.append({"type": "read_impression", "name": args["name"]})
+            elif kind in {"run_python", "calculate", "calc"} and (args.get("code") or args.get("expression")):
+                code = args.get("code") or f"print({args.get('expression', '')})"
+                actions.append({"type": "run_python", "code": code})
             elif kind == "noop":
                 actions.append({"type": "noop"})
         return actions
@@ -971,11 +1117,18 @@ class Agent:
         aliases = {
             "send": "send_message", "reply": "send_message", "message": "send_message",
             "wechat_send": "send_message", "image": "send_image", "send_photo": "send_image",
+            "generate_image": "generate_image", "draw_image": "generate_image", "create_image": "generate_image",
+            "image_generation": "generate_image",
+            "edit_image": "edit_image", "image_edit": "edit_image", "modify_image": "edit_image",
+            "retouch_image": "edit_image", "restyle_image": "edit_image",
             "focus": "focus_chat", "open_chat": "focus_chat", "select_chat": "focus_chat",
             "none": "noop",
             "write_memory": "write_memory", "write_skill": "write_skill", "write_impression": "write_impression",
             "read_impression": "read_impression", "read_person": "read_impression", "read_people": "read_impression",
             "read_chat_history": "read_chat_history", "chat_history": "read_chat_history", "read_history": "read_chat_history",
+            "run_python": "run_python", "python": "run_python", "calculate": "run_python", "calc": "run_python",
+            "build_wow_character_url": "build_wow_character_url", "wow_character_url": "build_wow_character_url",
+            "wow_character_link": "build_wow_character_url", "build_character_url": "build_wow_character_url",
         }
         kind = aliases.get(raw_type, raw_type)
         if not kind and (item.get("message") or item.get("text")):
@@ -996,6 +1149,25 @@ class Agent:
                 limit = 50
             result["limit"] = max(1, min(100, limit))
             return result
+        if kind == "run_python":
+            code = str(item.get("code") or item.get("script") or "").strip()
+            expression = str(item.get("expression") or item.get("expr") or "").strip()
+            if not code and expression:
+                code = f"print({expression})"
+            return {"type": "run_python", "code": code} if code else None
+        if kind == "build_wow_character_url":
+            title = str(item.get("title") or item.get("chat_title") or default_title).strip()
+            action = {
+                "type": "build_wow_character_url",
+                "title": title,
+                "character": str(item.get("character") or item.get("character_name") or "").strip(),
+                "server": str(item.get("server") or item.get("realm") or item.get("server_name") or "").strip(),
+                "player": str(item.get("player") or item.get("player_name") or item.get("owner") or "").strip(),
+                "class_name": str(item.get("class_name") or item.get("class") or item.get("job") or "").strip(),
+            }
+            if action["character"] or action["player"]:
+                return action
+            return None
         if kind == "delete_skill":
             name = str(item.get("name", "")).strip()
             return {"type": "delete_skill", "name": name} if name else None
@@ -1025,7 +1197,7 @@ class Agent:
             return {"type": "read_file", "path": str(item.get("path", ""))}
         if kind == "list_files":
             return {"type": "list_files", "pattern": str(item.get("pattern", ""))}
-        if kind not in {"send_message", "send_image", "focus_chat", "noop"}:
+        if kind not in {"send_message", "send_image", "generate_image", "edit_image", "focus_chat", "noop"}:
             return None
         if kind == "noop":
             return {"type": "noop"}
@@ -1042,4 +1214,42 @@ class Agent:
             if not image_path:
                 return None
             return {"type": "send_image", "title": title, "image_path": image_path}
+        if kind == "generate_image":
+            prompt = re.sub(
+                r"\s+",
+                " ",
+                str(item.get("prompt") or item.get("text") or item.get("description") or "").strip(),
+            )[:280]
+            if not prompt:
+                return None
+            action = {"type": "generate_image", "title": title, "prompt": prompt}
+            size = re.sub(r"\s+", "", str(item.get("size", "")).strip().lower())
+            if re.fullmatch(r"\d{2,4}x\d{2,4}", size):
+                action["size"] = size
+            return action
+        if kind == "edit_image":
+            prompt = re.sub(
+                r"\s+",
+                " ",
+                str(item.get("prompt") or item.get("text") or item.get("description") or "").strip(),
+            )[:800]
+            if not prompt:
+                return None
+            action = {"type": "edit_image", "title": title, "prompt": prompt}
+            image_path = str(
+                item.get("image_path")
+                or item.get("path")
+                or item.get("media_path")
+                or item.get("file_path")
+                or ""
+            ).strip()
+            image_url = str(item.get("image_url") or item.get("url") or "").strip()
+            if image_path:
+                action["image_path"] = image_path
+            if image_url:
+                action["image_url"] = image_url
+            size = re.sub(r"\s+", "", str(item.get("size", "")).strip().lower())
+            if re.fullmatch(r"\d{2,4}x\d{2,4}", size):
+                action["size"] = size
+            return action
         return {"type": "focus_chat", "title": title}

@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 from .agent import Agent, AgentError
 from .config import AppConfig
+from .image_editing import ImageEditingError, ImageEditor
+from .image_generation import ImageGenerationError, ImageGenerator
 from .models import OutboundReply, WxMessage
+from .python_sandbox import run_python_calculation
 from .reply import ReplyGenerator
-from .sender import SendError, WeChatSender
+from .sender import SendError, WeChatSender, sanitize_wechat_message
 from .state import SeenState
 from .wx_cli import WxCliClient, WxCliError
+
+
+_INTERNAL_ACTIONS = {"write_memory", "write_skill", "delete_skill", "write_impression"}
 
 
 class AutoSpeakBot:
@@ -26,6 +34,8 @@ class AutoSpeakBot:
         self.sender = WeChatSender(cfg)
         self.reply = ReplyGenerator(cfg)
         self.agent = Agent(cfg)
+        self.image_generator = ImageGenerator(cfg.image_generation)
+        self.image_editor = ImageEditor(cfg.image_editing)
         self.state = SeenState(cfg.state_path)
         self._last_group_reply: dict[str, float] = {}
         self._own_wxid, self._own_display = self._detect_self_info()
@@ -159,7 +169,13 @@ class AutoSpeakBot:
                 if text:
                     msg_actions = [{"type": "send_message", "title": msg.chat_title, "message": text, "source_fingerprint": fp}]
                     self._log("template-result", fingerprint=fp, action_count=1)
-            final = self._process_web_actions(msg_actions, original_chat_title=msg.chat_title, original_text=msg.text, original_sender=msg.sender)
+            final = self._process_web_actions(
+                msg_actions,
+                original_chat_title=msg.chat_title,
+                original_text=msg.text,
+                original_sender=msg.sender,
+                original_message=msg,
+            )
             if self._is_group(msg.chat_title) and msg.sender:
                 at_patterns = tuple(f"@{n}" for n in self.cfg.self_names)
                 if msg.text.startswith(at_patterns) or any(p in msg.text for p in at_patterns):
@@ -167,7 +183,11 @@ class AutoSpeakBot:
                         if a.get("type") == "send_message":
                             a["message"] = f"@{msg.sender} {a['message']}"
             all_final.extend(final)
-            send_like = [a for a in all_final if a.get("type") in {"send_message", "send_image"}]
+            send_like = [
+                a
+                for a in all_final
+                if a.get("type") in {"send_message", "send_image", "generate_image", "edit_image"}
+            ]
             if len(send_like) >= max(1, self.cfg.max_replies_per_tick):
                 self._log("tick-limit", send_like=len(send_like))
                 break
@@ -272,10 +292,19 @@ class AutoSpeakBot:
         return any(title.startswith(prefix) for prefix in self.cfg.group_title_prefixes)
 
     def _is_urgent_group_msg(self, msg: WxMessage) -> bool:
-        haystack = f"{msg.sender} {msg.text}"
+        return self._is_targeted_group_text(msg.text, sender=msg.sender)
+
+    def _is_targeted_group_text(self, text: str, *, sender: str = "") -> bool:
+        haystack = f"{sender} {text}"
         if any(keyword in haystack for keyword in self.cfg.group_reply_keywords):
             return True
-        return "@" in msg.text
+        if "[有人@我]" in text:
+            return True
+        for name in self.cfg.self_names:
+            clean = str(name or "").strip()
+            if clean and f"@{clean}" in text:
+                return True
+        return False
 
     def _heartbeat(self) -> None:
         self._log("heartbeat-tick")
@@ -292,7 +321,14 @@ class AutoSpeakBot:
         except AgentError as exc:
             self._log("heartbeat-error", error=str(exc))
 
-    def _process_web_actions(self, actions: list[dict[str, Any]], original_chat_title: str = "", original_text: str = "", original_sender: str = "") -> list[dict[str, Any]]:
+    def _process_web_actions(
+        self,
+        actions: list[dict[str, Any]],
+        original_chat_title: str = "",
+        original_text: str = "",
+        original_sender: str = "",
+        original_message: WxMessage | None = None,
+    ) -> list[dict[str, Any]]:
         max_rounds = 20
         current = list(actions)
         tool_trace: list[tuple[str, str]] = []
@@ -369,6 +405,107 @@ class AutoSpeakBot:
                             raw_result = f"No chat history found for {chat_title}."
                         self._log("web-fetch", round=_round + 1, method="read_chat_history", chat_title=chat_title, limit=limit, result_len=len(raw_result))
                         web_results.append((f"[chat_history] {chat_title} limit={limit}", raw_result[:6000]))
+                elif kind == "run_python":
+                    code = str(action.get("code", "") or "").strip()
+                    if code:
+                        result = run_python_calculation(code)
+                        raw_result = result.to_tool_text()
+                        self._log(
+                            "web-fetch",
+                            round=_round + 1,
+                            method="run_python",
+                            ok=result.ok,
+                            code_len=len(code),
+                            result_len=len(raw_result),
+                            result_preview=raw_result[:200],
+                        )
+                        web_results.append((f"[python_calculation] ok={str(result.ok).lower()}", raw_result[:4000]))
+                elif kind == "build_wow_character_url":
+                    result = self._build_wow_character_url(action, original_title=original_title)
+                    self._log(
+                        "web-fetch",
+                        round=_round + 1,
+                        method="build_wow_character_url",
+                        ok=bool(result.get("ok")),
+                        character=action.get("character", ""),
+                        player=action.get("player", ""),
+                        class_name=action.get("class_name", ""),
+                        result_len=len(str(result.get("message") or result.get("error") or "")),
+                        result_preview=str(result.get("message") or result.get("error") or "")[:200],
+                    )
+                    title = str(action.get("title") or original_title or "").strip()
+                    if title:
+                        kept.append({
+                            "type": "send_message",
+                            "title": title,
+                            "message": self._format_wow_character_result(result),
+                        })
+                elif kind == "generate_image":
+                    title = str(action.get("title", "") or action.get("chat_title", "") or original_title).strip()
+                    prompt = re.sub(r"\s+", " ", str(action.get("prompt", "") or action.get("text", "")).strip())[:280]
+                    size = re.sub(r"\s+", "", str(action.get("size", "")).strip().lower())
+                    if title and prompt:
+                        try:
+                            image_path = self.image_generator.generate_file(prompt=prompt, size=size)
+                            send_action = {
+                                "type": "send_image",
+                                "title": title,
+                                "image_path": str(image_path),
+                            }
+                            kept.append(send_action)
+                            self._log(
+                                "image-generated",
+                                round=_round + 1,
+                                title=title,
+                                path=str(image_path),
+                                size=size or self.cfg.image_generation.default_size,
+                            )
+                        except ImageGenerationError as exc:
+                            detail = re.sub(r"\s+", " ", str(exc)).strip()[:180]
+                            kept.append({
+                                "type": "send_message",
+                                "title": title,
+                                "message": f"图片生成失败：{detail}",
+                            })
+                            self._log("image-generate-error", round=_round + 1, error=detail)
+                elif kind == "edit_image":
+                    title = str(action.get("title", "") or action.get("chat_title", "") or original_title).strip()
+                    prompt = re.sub(r"\s+", " ", str(action.get("prompt", "") or action.get("text", "")).strip())[:800]
+                    size = re.sub(r"\s+", "", str(action.get("size", "")).strip().lower())
+                    image_path = str(action.get("image_path") or action.get("path") or "").strip()
+                    image_url = str(action.get("image_url") or action.get("url") or "").strip()
+                    if not image_path and not image_url:
+                        image_path, image_url = self._first_image_source(original_message)
+                    if title and prompt:
+                        try:
+                            image_path_out = self.image_editor.edit_file(
+                                prompt=prompt,
+                                image_path=image_path,
+                                image_url=image_url,
+                                size=size,
+                            )
+                            send_action = {
+                                "type": "send_image",
+                                "title": title,
+                                "image_path": str(image_path_out),
+                            }
+                            kept.append(send_action)
+                            self._log(
+                                "image-edited",
+                                round=_round + 1,
+                                title=title,
+                                source=image_path or image_url,
+                                path=str(image_path_out),
+                                size=size or self.cfg.image_editing.default_size,
+                            )
+                        except ImageEditingError as exc:
+                            detail = re.sub(r"\s+", " ", str(exc)).strip()[:180]
+                            kept.append({
+                                "type": "send_message",
+                                "title": title,
+                                "message": f"图片编辑失败：{detail}",
+                            })
+                            self._log("image-edit-error", round=_round + 1, error=detail)
                 elif kind == "read_impression":
                     name = re.sub(r"_[0-9a-f]{8}$", "", str(action.get("name", "") or "").strip())
                     if name:
@@ -377,6 +514,8 @@ class AutoSpeakBot:
                             raw_result = f"No stored impression found for {name}."
                         self._log("web-fetch", round=_round + 1, method="read_impression", name=name, result_len=len(raw_result))
                         web_results.append((f"[impression] {name}", raw_result[:4000]))
+                elif kind in _INTERNAL_ACTIONS:
+                    self._log("internal-action", action=kind, name=str(action.get("name", "") or ""))
                 else:
                     kept.append(action)
             if not web_results:
@@ -410,6 +549,14 @@ class AutoSpeakBot:
                 self._log("web-rounds-end", total_rounds=_round + 1, final_action_count=len(final))
                 return final
         final = self._finalize_if_needed(current, original_title, original_text, original_sender, tool_trace)
+        if not any(a.get("type") in {"send_message", "send_image", "noop", "focus_chat"} for a in final):
+            self._log("web-rounds-exhausted", total_rounds=max_rounds, remaining_actions=final[:5])
+            if original_title:
+                return [{
+                    "type": "send_message",
+                    "title": original_title,
+                    "message": "这个问题我刚才调用工具没算出来，工具循环已经到上限了，我先不硬猜。",
+                }]
         self._log("web-rounds-end", total_rounds=max_rounds, final_action_count=len(final))
         return final
 
@@ -445,16 +592,67 @@ class AutoSpeakBot:
             return False
         if not self._is_group(original_title):
             return True
-        haystack = f"{original_sender} {original_text}"
-        if any(keyword in haystack for keyword in self.cfg.group_reply_keywords):
-            return True
-        return "@" in original_text
+        return self._is_targeted_group_text(original_text, sender=original_sender)
+
+    def _build_wow_character_url(self, action: dict[str, Any], *, original_title: str = "") -> dict[str, Any]:
+        skill_dir = Path("data/skills/wow-character-link")
+        module_path = skill_dir / "builder.py"
+        if not module_path.is_file():
+            return {"ok": False, "error": f"wow-character-link builder not found: {module_path}"}
+        spec = importlib.util.spec_from_file_location("weauto_wow_character_link_builder", module_path)
+        if spec is None or spec.loader is None:
+            return {"ok": False, "error": "failed to load wow-character-link builder"}
+        module = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(module)
+            build = getattr(module, "build")
+            return dict(build(
+                character=str(action.get("character", "") or ""),
+                server=str(action.get("server", "") or ""),
+                player=str(action.get("player", "") or ""),
+                class_name=str(action.get("class_name", "") or ""),
+                skill_dir=skill_dir,
+            ))
+        except Exception as exc:
+            return {"ok": False, "error": f"wow-character-link failed: {exc}"}
+
+    @staticmethod
+    def _format_wow_character_result(result: dict[str, Any]) -> str:
+        if result.get("ok"):
+            return str(result.get("message") or result.get("url") or "").strip()
+        candidates = result.get("candidates")
+        if isinstance(candidates, list) and candidates:
+            rows = []
+            for item in candidates[:8]:
+                if not isinstance(item, dict):
+                    continue
+                rows.append(
+                    f"{item.get('player', '')} / {item.get('character', '')} / "
+                    f"{item.get('server', '')} / {item.get('class', '')}"
+                )
+            if rows:
+                return str(result.get("error") or "没唯一匹配到角色") + "\n" + "\n".join(rows)
+        return str(result.get("error") or "没构建出角色链接")
 
     def _proxy_args(self, use_proxy: bool) -> tuple[list[str], dict[str, str]]:
         p = self.cfg.proxy
         if use_proxy and p.enabled and p.url:
             return ["--proxy", p.url, "--noproxy", p.no_proxy] if p.no_proxy else ["--proxy", p.url], {}
         return [], {}
+
+    @staticmethod
+    def _first_image_source(msg: WxMessage | None) -> tuple[str, str]:
+        if msg is None:
+            return "", ""
+        first_url = ""
+        for att in msg.attachments:
+            if att.type != "image":
+                continue
+            if att.path:
+                return att.path, ""
+            if att.url and not first_url:
+                first_url = att.url
+        return "", first_url
 
     def _strip_html(self, text: str) -> str:
         import re
@@ -673,7 +871,8 @@ class AutoSpeakBot:
                         continue
                     if kind == "send_message":
                         title = str(action.get("title") or "").strip()
-                        message = str(action.get("message") or "").strip()
+                        message = sanitize_wechat_message(str(action.get("message") or ""))
+                        action["message"] = message
                         if self.sender.send_message(title, message):
                             executed.append(action)
                             did_send_like = True
@@ -685,8 +884,39 @@ class AutoSpeakBot:
                             executed.append(action)
                             did_send_like = True
                         continue
+                    if kind == "generate_image":
+                        title = str(action.get("title") or action.get("chat_title") or "").strip()
+                        prompt = re.sub(r"\s+", " ", str(action.get("prompt", "")).strip())[:280]
+                        size = re.sub(r"\s+", "", str(action.get("size", "")).strip().lower())
+                        image_path = self.image_generator.generate_file(prompt=prompt, size=size)
+                        if self.sender.send_image(title, str(image_path)):
+                            action["image_path"] = str(image_path)
+                            executed.append(action)
+                            did_send_like = True
+                        continue
+                    if kind == "edit_image":
+                        title = str(action.get("title") or action.get("chat_title") or "").strip()
+                        prompt = re.sub(r"\s+", " ", str(action.get("prompt", "")).strip())[:800]
+                        size = re.sub(r"\s+", "", str(action.get("size", "")).strip().lower())
+                        source_path = str(action.get("image_path") or action.get("path") or "").strip()
+                        source_url = str(action.get("image_url") or action.get("url") or "").strip()
+                        image_path = self.image_editor.edit_file(
+                            prompt=prompt,
+                            image_path=source_path,
+                            image_url=source_url,
+                            size=size,
+                        )
+                        if self.sender.send_image(title, str(image_path)):
+                            action["image_path"] = str(image_path)
+                            executed.append(action)
+                            did_send_like = True
+                        continue
+                    if kind in _INTERNAL_ACTIONS:
+                        self._log("internal-action", action=kind, name=str(action.get("name", "") or ""))
+                        executed.append(action)
+                        continue
                     self._log("action-skip", reason="unsupported", action=kind)
-                except SendError as exc:
+                except (SendError, ImageGenerationError) as exc:
                     self._log("send-skip", action=kind, error=str(exc))
                 finally:
                     if did_send_like and self.cfg.send_action_interval_sec > 0:
@@ -701,3 +931,209 @@ class AutoSpeakBot:
             **fields,
         }
         print(json.dumps(record, ensure_ascii=False, default=str), flush=True)
+        human = AutoSpeakBot._human_log_line(event, fields)
+        if human:
+            print(human, flush=True)
+
+    @staticmethod
+    def _human_log_line(event: str, fields: dict[str, Any]) -> str:
+        if event == "start":
+            return (
+                f"[start] mode={fields.get('processing_mode')} dry_run={str(fields.get('dry_run')).lower()} "
+                f"poll={fields.get('poll_interval_sec')}s"
+            )
+        if event == "doctor":
+            status = fields.get("status")
+            check = fields.get("check") or fields.get("wx_binary") or ""
+            extra = ""
+            if "visible_rows" in fields:
+                extra = f" visible_rows={fields.get('visible_rows')}"
+            if fields.get("error"):
+                extra = f" error={AutoSpeakBot._clip(fields.get('error'), 120)}"
+            return f"[doctor] {status or 'check'} {check}{extra}".strip()
+        if event == "visible-row":
+            return (
+                f"[row] #{fields.get('row')} {AutoSpeakBot._clip(fields.get('title'), 40)} "
+                f"| {AutoSpeakBot._clip(fields.get('preview'), 80)}"
+            )
+        if event == "startup":
+            status = fields.get("status") or "seen"
+            count = fields.get("marked_seen")
+            suffix = f" marked_seen={count}" if count is not None else ""
+            if fields.get("error"):
+                suffix += f" error={AutoSpeakBot._clip(fields.get('error'), 120)}"
+            return f"[startup] {status}{suffix}"
+        if event == "tick":
+            return f"[tick] incoming={fields.get('incoming', 0)} retry={fields.get('retry', 0)}"
+        if event == "message":
+            text = fields.get("text") or ""
+            if not text and fields.get("attachments"):
+                text = f"[attachments={fields.get('attachments')}]"
+            return (
+                f"[msg] {AutoSpeakBot._clip(fields.get('chat'), 36)} <- "
+                f"{AutoSpeakBot._clip(fields.get('sender') or '-', 24)} "
+                f"{fields.get('message_type') or fields.get('chat_type')}: {AutoSpeakBot._clip(text, 120)}"
+            )
+        if event == "message-skip":
+            return (
+                f"[skip] {fields.get('reason')} chat={AutoSpeakBot._clip(fields.get('chat'), 36)} "
+                f"fp={AutoSpeakBot._clip(fields.get('fingerprint'), 12)}"
+            )
+        if event == "reply-cooldown-start":
+            return f"[cooldown] chat={AutoSpeakBot._clip(fields.get('chat'), 36)} next={fields.get('cooldown_sec')}s"
+        if event in {"agent-result", "heartbeat-result", "template-result"}:
+            summary = AutoSpeakBot._summarize_actions(fields.get("actions"))
+            suffix = f" {summary}" if summary else ""
+            return f"[agent] actions={fields.get('action_count', 0)}{suffix}"
+        if event == "agent-bad-response":
+            return f"[agent] bad-response fp={AutoSpeakBot._clip(fields.get('fingerprint'), 12)} raw={AutoSpeakBot._clip(fields.get('raw'), 160)}"
+        if event == "agent-skip":
+            return f"[agent] skip fp={AutoSpeakBot._clip(fields.get('fingerprint'), 12)} error={AutoSpeakBot._clip(fields.get('error'), 140)}"
+        if event == "web-rounds-start":
+            title = AutoSpeakBot._clip(fields.get("original_title"), 36)
+            return f"[tools] start chat={title} actions={fields.get('action_count', 0)}"
+        if event == "web-fetch":
+            return AutoSpeakBot._human_tool_line(fields)
+        if event == "web-feed-prompt":
+            return f"[llm] feed round={fields.get('round')} prompt_len={fields.get('prompt_len')}"
+        if event == "web-feed-result":
+            summary = AutoSpeakBot._summarize_actions(fields.get("actions"))
+            suffix = f" {summary}" if summary else ""
+            return f"[llm] round={fields.get('round')} actions={fields.get('action_count', 0)}{suffix}"
+        if event == "web-result-error":
+            return f"[llm] round={fields.get('round')} error={AutoSpeakBot._clip(fields.get('error'), 140)}"
+        if event == "web-rounds-end":
+            return f"[tools] end rounds={fields.get('total_rounds')} final_actions={fields.get('final_action_count')}"
+        if event == "web-rounds-exhausted":
+            summary = AutoSpeakBot._summarize_actions(fields.get("remaining_actions"))
+            suffix = f" remaining={summary}" if summary else ""
+            return f"[tools] exhausted rounds={fields.get('total_rounds')}{suffix}"
+        if event == "web-finalize-start":
+            return (
+                f"[finalize] chat={AutoSpeakBot._clip(fields.get('original_title'), 36)} "
+                f"trace_len={fields.get('trace_len')}"
+            )
+        if event == "web-finalize-result":
+            summary = AutoSpeakBot._summarize_actions(fields.get("actions"))
+            suffix = f" {summary}" if summary else ""
+            return f"[finalize] actions={fields.get('action_count', 0)}{suffix}"
+        if event == "web-finalize-error":
+            return f"[finalize] error={AutoSpeakBot._clip(fields.get('error'), 140)}"
+        if event == "image-generated":
+            return (
+                f"[image] generated chat={AutoSpeakBot._clip(fields.get('title'), 36)} "
+                f"size={fields.get('size')} path={AutoSpeakBot._clip(fields.get('path'), 90)}"
+            )
+        if event == "image-generate-error":
+            return f"[image] error round={fields.get('round')} {AutoSpeakBot._clip(fields.get('error'), 140)}"
+        if event == "image-edited":
+            return (
+                f"[image] edited chat={AutoSpeakBot._clip(fields.get('title'), 36)} "
+                f"source={AutoSpeakBot._clip(fields.get('source'), 50)} "
+                f"path={AutoSpeakBot._clip(fields.get('path'), 90)}"
+            )
+        if event == "image-edit-error":
+            return f"[image] edit-error round={fields.get('round')} {AutoSpeakBot._clip(fields.get('error'), 140)}"
+        if event == "action":
+            return f"[action] step={fields.get('step')} type={fields.get('type')}"
+        if event == "dry-run":
+            return f"[dry-run] action={fields.get('action')} title={AutoSpeakBot._clip(fields.get('title'), 36)}"
+        if event == "focused":
+            return f"[focus] title={AutoSpeakBot._clip(fields.get('title'), 36)}"
+        if event == "action-skip":
+            return f"[action] skip reason={fields.get('reason')} action={fields.get('action')}"
+        if event == "internal-action":
+            name = AutoSpeakBot._clip(fields.get("name"), 40)
+            suffix = f" name={name}" if name else ""
+            return f"[internal] {fields.get('action')}{suffix}"
+        if event == "send-skip":
+            return f"[send] skip action={fields.get('action')} error={AutoSpeakBot._clip(fields.get('error'), 140)}"
+        if event == "tick-limit":
+            return f"[tick] send_limit send_like={fields.get('send_like')}"
+        if event == "heartbeat-tick":
+            return "[heartbeat] tick"
+        if event in {"error", "heartbeat-error", "wx-cli-error"}:
+            return f"[error] {event}: {AutoSpeakBot._clip(fields.get('error'), 160)}"
+        return ""
+
+    @staticmethod
+    def _human_tool_line(fields: dict[str, Any]) -> str:
+        method = str(fields.get("method") or "")
+        subject = (
+            fields.get("query")
+            or fields.get("url")
+            or fields.get("path")
+            or fields.get("pattern")
+            or fields.get("chat_title")
+            or fields.get("name")
+            or fields.get("player")
+            or fields.get("character")
+            or ""
+        )
+        extras: list[str] = []
+        if "ok" in fields:
+            extras.append(f"ok={str(fields.get('ok')).lower()}")
+        if "limit" in fields:
+            extras.append(f"limit={fields.get('limit')}")
+        if "code_len" in fields:
+            extras.append(f"code={fields.get('code_len')} chars")
+        if "proxy" in fields:
+            extras.append(f"proxy={str(fields.get('proxy')).lower()}")
+        extras.append(f"len={fields.get('result_len', 0)}")
+        return (
+            f"[tool] r{fields.get('round')} {method} "
+            f"{AutoSpeakBot._clip(subject, 100)} {' '.join(extras)}"
+        ).rstrip()
+
+    @staticmethod
+    def _summarize_actions(actions: Any, limit: int = 4) -> str:
+        if not isinstance(actions, list):
+            return ""
+        parts: list[str] = []
+        for action in actions[:limit]:
+            if not isinstance(action, dict):
+                continue
+            kind = str(action.get("type") or "?")
+            if kind == "send_message":
+                title = AutoSpeakBot._clip(action.get("title"), 28)
+                message = AutoSpeakBot._clip(action.get("message"), 70)
+                parts.append(f"send_message->{title}: {message}")
+            elif kind == "send_image":
+                title = AutoSpeakBot._clip(action.get("title"), 28)
+                path = AutoSpeakBot._clip(action.get("image_path"), 60)
+                parts.append(f"send_image->{title}: {path}")
+            elif kind == "generate_image":
+                prompt = AutoSpeakBot._clip(action.get("prompt") or action.get("text"), 70)
+                parts.append(f"generate_image: {prompt}")
+            elif kind == "edit_image":
+                prompt = AutoSpeakBot._clip(action.get("prompt") or action.get("text"), 70)
+                parts.append(f"edit_image: {prompt}")
+            elif kind in {"search_web", "search_web_brave", "search_web_volc"}:
+                parts.append(f"{kind}: {AutoSpeakBot._clip(action.get('query'), 70)}")
+            elif kind in {"fetch_url", "browse_url"}:
+                parts.append(f"{kind}: {AutoSpeakBot._clip(action.get('url'), 70)}")
+            elif kind == "read_chat_history":
+                chat = AutoSpeakBot._clip(action.get("chat_title") or action.get("title"), 28)
+                parts.append(f"read_chat_history->{chat} limit={action.get('limit', 50)}")
+            elif kind == "read_impression":
+                parts.append(f"read_impression:{AutoSpeakBot._clip(action.get('name'), 40)}")
+            elif kind == "run_python":
+                parts.append(f"run_python:{len(str(action.get('code') or ''))} chars")
+            elif kind == "build_wow_character_url":
+                who = AutoSpeakBot._clip(action.get("player") or action.get("character"), 40)
+                klass = AutoSpeakBot._clip(action.get("class_name"), 20)
+                parts.append(f"build_wow_character_url:{who} {klass}".strip())
+            elif kind == "focus_chat":
+                parts.append(f"focus_chat->{AutoSpeakBot._clip(action.get('title'), 28)}")
+            else:
+                parts.append(kind)
+        if len(actions) > limit:
+            parts.append(f"+{len(actions) - limit} more")
+        return "; ".join(parts)
+
+    @staticmethod
+    def _clip(value: Any, limit: int = 80) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 3)] + "..."

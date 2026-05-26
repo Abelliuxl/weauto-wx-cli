@@ -6,6 +6,7 @@ import re
 import shutil
 import sqlite3
 import struct
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -370,6 +371,27 @@ class ImageResolver:
 
     @staticmethod
     def _extract_uin_from_kvcomm(kvcomm_dir: Path) -> int | None:
+        candidates: list[tuple[float, int]] = []
+        for f in kvcomm_dir.iterdir():
+            name = f.name
+            if name.startswith("key_") and name.endswith(".statistic"):
+                rest = name[len("key_"):]
+                uin_str = rest.split("_")[0]
+                try:
+                    uin = int(uin_str)
+                except (ValueError, IndexError):
+                    continue
+                if uin == 0:
+                    continue
+                try:
+                    mtime = f.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                candidates.append((mtime, uin))
+        if candidates:
+            candidates.sort(reverse=True)
+            return candidates[0][1]
+
         for f in kvcomm_dir.iterdir():
             name = f.name
             if name.startswith("key_") and name.endswith(".statistic"):
@@ -438,6 +460,16 @@ class ImageResolver:
             fmt = self._detect_format(decrypted)
             if fmt == "bin":
                 continue
+            if fmt == "hevc":
+                out_name = f"{file_md5}_png.png"
+                out_path = self.output_dir / out_name
+                if self._write_hevc_as_png(decrypted, out_path):
+                    return [
+                        Attachment(type="image", path=str(out_path.resolve()))
+                    ]
+                if best_out is None:
+                    best_out = (decrypted, fmt, file_md5)
+                continue
             if fmt in preferred:
                 out_name = f"{file_md5}_{fmt}.{fmt}"
                 out_path = self.output_dir / out_name
@@ -456,6 +488,43 @@ class ImageResolver:
             return [Attachment(type="image", path=str(out_path.resolve()))]
 
         return self._clean_attachments(msg.attachments)
+
+    @staticmethod
+    def _write_hevc_as_png(data: bytes, output_path: Path) -> bool:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            return False
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                in_path = Path(tmp) / "input.hevc"
+                out_path = Path(tmp) / "output.png"
+                in_path.write_bytes(data)
+                proc = subprocess.run(
+                    [
+                        ffmpeg,
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-f",
+                        "hevc",
+                        "-i",
+                        str(in_path),
+                        "-frames:v",
+                        "1",
+                        str(out_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                if proc.returncode != 0 or not out_path.is_file():
+                    return False
+                shutil.copyfile(out_path, output_path)
+                return True
+        except (OSError, subprocess.SubprocessError):
+            return False
 
     @staticmethod
     def _decrypt_v2(data: bytes, aes_key: bytes, xor_key: int) -> bytes | None:

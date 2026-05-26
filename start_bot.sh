@@ -21,7 +21,11 @@ LOG_FILE="${LOG_FILE:-logs/$(date +%Y%m%d_%H%M%S)_${COMMAND}.log}"
 if [ "$COMMAND" != "logs" ]; then
   ln -sf "$(basename "$LOG_FILE")" logs/latest.log
 fi
-exec > >(tee -a "$LOG_FILE") 2>&1
+if [ "${WEAUTO_PRETTY_LOGS:-1}" = "1" ] && [ "$COMMAND" != "logs" ]; then
+  exec > >(PYTHONPATH="$ROOT_DIR" python3 -m weauto_wx_cli.log_view "$LOG_FILE") 2>&1
+else
+  exec > >(tee -a "$LOG_FILE") 2>&1
+fi
 export PYTHONUNBUFFERED=1
 
 echo "[start-bot] root=$ROOT_DIR"

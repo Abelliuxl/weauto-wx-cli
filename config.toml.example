@@ -57,6 +57,42 @@ people_aliases_path = "data/PEOPLE_ALIASES.md"
 people_memory_dir = "data/people"
 people_context_max_items = 8
 
+# Image generation. When enabled and configured, the agent can call
+# generate_image(prompt, size) and this project will generate a local image file,
+# then send it through the existing GUI image sender.
+[image_generation]
+enabled = false
+provider = "dashscope_z_image"  # openai_compat | dashscope_z_image
+base_url = "https://dashscope.aliyuncs.com/api/v1/services/aigc"
+base_url_env = "DASHSCOPE_BASE_URL"
+api_key = ""
+api_key_env = "DASHSCOPE_API_KEY"
+model = "z-image-turbo"
+timeout_sec = 90.0
+download_timeout_sec = 45.0
+default_size = "1024x1024"
+output_dir = "data/generated_images"
+
+# Image editing. When enabled, the agent can call edit_image(prompt) for an
+# inbound WeChat image. The project submits the resolved local image to Bailian
+# as a Base64 data URI, downloads the edited result, then sends it through the
+# existing GUI image sender.
+[image_editing]
+enabled = false
+provider = "dashscope_qwen_image_edit"
+base_url = "https://dashscope.aliyuncs.com/api/v1/services/aigc"
+base_url_env = "DASHSCOPE_BASE_URL"
+api_key = ""
+api_key_env = "DASHSCOPE_API_KEY"
+model = "qwen-image-2.0-pro"
+timeout_sec = 120.0
+download_timeout_sec = 45.0
+default_size = ""  # empty keeps the source image aspect ratio/model default
+output_dir = "data/edited_images"
+watermark = false
+prompt_extend = true
+max_input_bytes = 10485760
+
 # Proxy used by this project process and Hermes CLI mode.
 # start_bot.sh removes proxy env from launchd-managed Hermes gateway because
 # launchd Python cannot reliably route to this LAN proxy on this machine.
@@ -92,6 +128,18 @@ model = "LongCat-Flash-Lite"
 base_url = "https://api.longcat.chat/openai/v1"
 timeout_sec = 60.0
 max_tokens = 4096
+temperature = 0.0
+
+# Reply LLM writes the final natural-language WeChat message.
+# It can use the same model/key as main with a warmer temperature.
+[agent.reply]
+api_key = ""
+api_key_env = "LONGCAT_API_KEY"
+model = "LongCat-Flash-Lite"
+base_url = "https://api.longcat.chat/openai/v1"
+timeout_sec = 60.0
+max_tokens = 2048
+temperature = 0.7
 
 # Vision LLM for image analysis (called as a tool by the main LLM)
 [agent.vision]
@@ -101,6 +149,7 @@ model = "doubao-seed-2-0-mini-260215"
 base_url = ""  # falls back to env DOUBAO_BASE_URL
 timeout_sec = 60.0
 max_tokens = 4096
+temperature = 0.0
 
 # Ratios are relative to the main WeChat window.
 [list_region]

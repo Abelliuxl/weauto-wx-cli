@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+import re
 
 from .config import AppConfig
 from .detector import detect_chat_rows, title_matches
@@ -15,6 +16,33 @@ from .window import WindowBounds, get_front_window_bounds, screenshot_region
 
 class SendError(RuntimeError):
     pass
+
+
+def sanitize_wechat_message(text: str) -> str:
+    clean = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    clean = re.sub(r"```(?:[A-Za-z0-9_-]+)?\n?", "", clean)
+    clean = clean.replace("```", "")
+    lines: list[str] = []
+    for raw_line in clean.split("\n"):
+        line = raw_line.strip()
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        line = re.sub(r"^>\s*", "", line)
+        line = re.sub(r"^\s*[-*+]\s+", "", line)
+        line = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 \2", line)
+        line = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\1 \2", line)
+        line = re.sub(r"(?<!\*)\*\*([^*\n]+)\*\*(?!\*)", r"\1", line)
+        line = re.sub(r"(?<!_)__([^_\n]+)__(?!_)", r"\1", line)
+        line = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", line)
+        line = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"\1", line)
+        line = line.replace("`", "")
+        line = re.sub(r"[_＿]+", "", line)
+        line = re.sub(r"\s*[-‐‑‒–—―]{2,}\s*", "，", line)
+        line = re.sub(r"\s*[–—―]\s*", "，", line)
+        line = re.sub(r"，{2,}", "，", line)
+        lines.append(line.rstrip())
+    clean = "\n".join(lines)
+    clean = re.sub(r"\n{3,}", "\n\n", clean)
+    return clean.strip()
 
 
 class WeChatSender:
@@ -45,7 +73,7 @@ class WeChatSender:
     def send_message(self, chat_title: str, message: str) -> bool:
         with self.send_lock():
             chat_title = str(chat_title or "").strip()
-            message = str(message or "").strip()
+            message = sanitize_wechat_message(message)
             if not chat_title or not message:
                 raise SendError("chat_title and message are required")
 

@@ -21,7 +21,19 @@ _UNREAD_NUM_RE = re.compile(r"^\d{1,3}$")
 
 
 def normalize_title(text: str) -> str:
-    return re.sub(r"[\s:：,，。.!！?？@]+", "", text or "").lower()
+    text = str(text or "").translate(
+        str.maketrans({
+            "－": "-",
+            "‐": "-",
+            "‑": "-",
+            "‒": "-",
+            "–": "-",
+            "—": "-",
+            "―": "-",
+            "﹣": "-",
+        })
+    )
+    return re.sub(r"[\s:：,，。.!！?？@]+", "", text).lower()
 
 
 def title_matches(expected: str, actual: str) -> bool:
